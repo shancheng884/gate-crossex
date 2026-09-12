@@ -1,0 +1,13 @@
+{
+  "targetNotionalUsd": 6000,
+  "adrRatio": 10,
+  "pollIntervalMs": 5000,
+  "confirmations": 2,
+  "rearmBufferPct": 0.3,
+  "maxNotionalImbalancePct": 1,
+  "entryTiers": [
+    { "id": 1, "entryPct": 39.5, "takeProfitPct": 37 },
+    { "id": 2, "entryPct": 40.5, "takeProfitPct": 38 },
+    { "id": 3, "entryPct": 41.5, "takeProfitPct": 39 }
+  ]
+}

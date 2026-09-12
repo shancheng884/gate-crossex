@@ -1,0 +1,16 @@
+{
+  "name": "skhy-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node --env-file=.env src/monitor.mjs",
+    "once": "node src/monitor.mjs --once",
+    "telegram-check": "node --env-file=.env src/monitor.mjs --telegram-check",
+    "chat-id": "node --env-file=.env src/monitor.mjs --chat-id",
+    "test": "node --test"
+  }
+}
