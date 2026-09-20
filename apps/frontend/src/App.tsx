@@ -19,6 +19,7 @@ import {
   type PrivateStreamStatus,
   type PublicTrade,
   type StrategyRecord,
+  type SystemDiscovery,
   type TerminalStreamHandle,
   type TradingMode,
   type TradingSnapshot,
@@ -531,6 +532,7 @@ function App() {
   const [feesReady, setFeesReady] = useState(false);
   const [feesError, setFeesError] = useState<string | null>(null);
   const [tradingMode, setTradingMode] = useState<TradingMode | null>(null);
+  const [systemDiscovery, setSystemDiscovery] = useState<SystemDiscovery | null>(null);
   const [modeDialogOpen, setModeDialogOpen] = useState(false);
   const [connection, setConnection] = useState<CredentialConnectionStatus | null>(null);
   const [editingAccountName, setEditingAccountName] = useState(false);
@@ -580,6 +582,12 @@ function App() {
   const refreshConnection = useCallback(async () => {
     const next = await api.connection();
     setConnection(next);
+    return next;
+  }, []);
+
+  const refreshSystemDiscovery = useCallback(async () => {
+    const next = await api.discovery();
+    setSystemDiscovery(next);
     return next;
   }, []);
 
@@ -753,6 +761,21 @@ function App() {
   useEffect(() => {
     void api.tradingMode().then((response) => setTradingMode(response.mode)).catch(reportBackendConnectivityError);
   }, [reportBackendConnectivityError]);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      void refreshSystemDiscovery().catch(reportBackendConnectivityError);
+    };
+    refresh();
+    const timer = window.setInterval(() => {
+      if (active) refresh();
+    }, 15_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [refreshSystemDiscovery, reportBackendConnectivityError]);
 
   useEffect(() => {
     if (workspace === 'Funding Rates') return;
@@ -1384,6 +1407,10 @@ function App() {
     {showBackendOffline && <section className="system-banner offline-banner" role="alert">
       <div><strong>{t('Backend is offline')}</strong><span>{t('The local backend has not responded. Run ./run doctor, then restart it with ./run.')}</span></div>
       <button onClick={() => window.location.reload()}>{t('Retry')}</button>
+    </section>}
+    {systemDiscovery?.autoActivation?.enabled && systemDiscovery.autoActivation.status !== 'live' && <section className={`system-banner auto-activation-banner ${systemDiscovery.autoActivation.status}`} role="status">
+      <div><strong>{t(systemDiscovery.autoActivation.status === 'blocked' ? 'VPS live activation blocked' : 'VPS live activation pending')}</strong><span>{systemDiscovery.autoActivation.reason ?? t('The VPS is preparing to restore live strategies safely.')}</span></div>
+      <button onClick={() => { void refreshSystemDiscovery().catch(reportBackendConnectivityError); }}>{t('Refresh')}</button>
     </section>}
     <main className="workspace">
       <Suspense fallback={<div className="route-loading" role="status">{t('Loading workspace…')}</div>}>

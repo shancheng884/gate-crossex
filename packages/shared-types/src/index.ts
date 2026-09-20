@@ -15,6 +15,11 @@ export const HealthResponseSchema = z.object({
   database: z.enum(['ok','missing','error']),
   apiDocsRetrievedAt: z.string(),
   connectionState: ConnectionStateSchema,
+  autoActivation: z.object({
+    enabled: z.boolean(),
+    status: z.enum(['disabled', 'pending', 'live', 'blocked']),
+    reason: z.string().nullable(),
+  }).optional(),
 });
 export type HealthResponse = z.infer<typeof HealthResponseSchema>;
 export interface RiskRule { id: string; scope: 'account'|'venue'|'asset'|'strategy'; metric: string; limit: string; enabled: boolean; }
@@ -30,6 +35,12 @@ export const SystemDiscoverySchema = z.object({
   mode: EnvironmentSchema,
   authenticatedTradingEnabled: z.boolean(),
   tradingMode: TradingModeSchema,
+  autoActivation: z.object({
+    enabled: z.boolean(),
+    status: z.enum(['disabled', 'pending', 'live', 'blocked']),
+    reason: z.string().nullable(),
+    lastAttemptAt: z.string().nullable(),
+  }).optional(),
   docs: z.object({ apiVersion: z.string(), retrievedAt: z.string() }),
   database: z.object({ migrationCount: z.number().int().nonnegative(), currentMigration: z.string().nullable() }),
   security: z.object({
@@ -909,6 +920,13 @@ export const BorosStrategiesResponseSchema = BorosUpstreamStrategiesResponseSche
 });
 export type BorosStrategiesResponse = z.infer<typeof BorosStrategiesResponseSchema>;
 
+export const PremiumGridTierSchema = z.object({
+  entryPremiumPct: SignedDecimalTextSchema,
+  takeProfitPremiumPct: SignedDecimalTextSchema,
+  quantity: PositiveDecimalTextSchema,
+});
+export type PremiumGridTier = z.infer<typeof PremiumGridTierSchema>;
+
 export const StrategyConfigSchema = z.object({
   kind: z.enum(['position', 'auto', 'premium']),
   asset: z.string(),
@@ -929,6 +947,8 @@ export const StrategyConfigSchema = z.object({
   grid: z.boolean().optional(),
   gridStepPct: PositiveDecimalTextSchema.optional(),
   gridLevels: z.number().int().positive().optional(),
+  /** Optional explicit premium levels. Quantities are expressed in the left/ADR asset. */
+  gridTiers: z.array(PremiumGridTierSchema).min(1).max(30).optional(),
   totalAmount: PositiveDecimalTextSchema.optional(),
   maxPosition: PositiveDecimalTextSchema.optional(),
   perOrderQuantity: PositiveDecimalTextSchema,

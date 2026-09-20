@@ -1,0 +1,25 @@
+[Unit]
+Description=Gate CrossEx local trading terminal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gate-crossex
+Group=gate-crossex
+WorkingDirectory=/opt/gate-crossex/current
+EnvironmentFile=/etc/gate-crossex.env
+ExecStart=/usr/bin/node /opt/gate-crossex/current/apps/backend/dist/server.js
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gate-crossex
+
+[Install]
+WantedBy=multi-user.target

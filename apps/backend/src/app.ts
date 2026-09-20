@@ -801,6 +801,44 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     ...(options.startMarketStream ? { connectionState: () => marketHub.connectionState() } : {}),
   }, options.strategyEngineOptions);
 
+  type AutoActivationStatus = 'disabled' | 'pending' | 'live' | 'blocked';
+  let autoActivationStatus: AutoActivationStatus = config.autoActivateLive ? 'pending' : 'disabled';
+  let autoActivationReason: string | null = null;
+  let autoActivationLastAttemptAt: string | null = null;
+  let autoActivationTimer: ReturnType<typeof setTimeout> | null = null;
+  let autoActivationInFlight = false;
+  let autoActivationAttempt = 0;
+
+  const autoActivationSnapshot = () => ({
+    enabled: config.autoActivateLive,
+    status: autoActivationStatus,
+    reason: autoActivationReason,
+    lastAttemptAt: autoActivationLastAttemptAt,
+  });
+
+  /** Verify the persisted Gate credentials and reconcile remote orders before enabling live mode. */
+  const verifyAndPrepareLiveActivation = async (): Promise<void> => {
+    const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
+    if (!credentials) throw new TradingRuntimeError('credential_not_configured', 409);
+    const account = await crossExGateway.queryAccount(credentials);
+    const verifiedAt = new Date().toISOString();
+    const profileId = activeCredentialProfileId ?? DEFAULT_CREDENTIAL_PROFILE;
+    const existing = getCredentialMetadata(database, profileId);
+    const provider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE) ?? credentialVault.provider;
+    upsertCredentialMetadata(database, {
+      id: profileId,
+      label: existing?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
+      provider,
+      createdAt: existing?.createdAt ?? verifiedAt,
+      lastVerifiedAt: verifiedAt,
+    });
+    addAuditEvent(database, 'live_mode_credential_verified', {
+      profile: profileId,
+      accountMode: account.account_mode,
+    });
+    await strategyEngine.prepareForLiveActivation();
+  };
+
   const quiesceForCredentialMutation = async (): Promise<void> => {
     const previous = tradingSession.current;
     if (previous === 'live') {
@@ -860,6 +898,84 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
             },
           },
   });
+
+  const autoActivationFailureReason = (error: unknown): string => {
+    if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) return error.code;
+    if (error instanceof GateApiError) return error.label;
+    return 'LOCAL_AUTO_ACTIVATION_ERROR';
+  };
+
+  const autoActivationCanRetry = (error: unknown): boolean => {
+    if (error instanceof GateApiError) return error.statusCode === 0 || error.statusCode === 429 || error.statusCode >= 500;
+    if (error instanceof TradingRuntimeError) {
+      return error.code === 'credential_not_configured'
+        || error.code === 'credential_missing_from_vault'
+        || error.code === 'credential_mutation_in_progress';
+    }
+    return false;
+  };
+
+  const scheduleAutoActivation = (delayMs: number): void => {
+    if (!config.autoActivateLive || autoActivationStatus !== 'pending') return;
+    if (autoActivationTimer) clearTimeout(autoActivationTimer);
+    autoActivationTimer = setTimeout(() => {
+      autoActivationTimer = null;
+      void runAutoActivation();
+    }, delayMs);
+    autoActivationTimer.unref?.();
+  };
+
+  const runAutoActivation = async (): Promise<void> => {
+    if (!config.autoActivateLive || autoActivationStatus === 'blocked' || autoActivationStatus === 'live' || autoActivationInFlight) return;
+    if (tradingSession.liveTradingEnabled) {
+      autoActivationStatus = 'live';
+      autoActivationReason = null;
+      return;
+    }
+    autoActivationInFlight = true;
+    autoActivationAttempt += 1;
+    autoActivationLastAttemptAt = new Date().toISOString();
+    try {
+      await runAuthenticatedWrite(async () => {
+        if (tradingSession.liveTradingEnabled) return;
+        await verifyAndPrepareLiveActivation();
+        const previous = tradingSession.current;
+        const mode = tradingSession.set('live');
+        strategyEngine.activatePersistedStrategies(activeCredentialProfileId);
+        addAuditEvent(database, 'trading_mode_changed', {
+          from: previous,
+          to: mode,
+          disclaimerAccepted: false,
+          unresolvedOrderCount: 0,
+          source: 'auto_boot',
+        });
+      });
+      autoActivationStatus = 'live';
+      autoActivationReason = null;
+      app.log.info({ attempt: autoActivationAttempt }, 'automatic live trading activation completed');
+    } catch (error) {
+      autoActivationReason = autoActivationFailureReason(error);
+      if (error instanceof StrategyEngineError && error.code === 'strategy_recovery_unresolved') {
+        autoActivationStatus = 'blocked';
+        addAuditEvent(database, 'live_mode_activation_blocked', {
+          profile: activeCredentialProfileId ?? DEFAULT_CREDENTIAL_PROFILE,
+          source: 'auto_boot',
+          ...error.details,
+        });
+        app.log.error({ ...error.details }, 'automatic live trading activation blocked by unreconciled orders');
+      } else if (autoActivationCanRetry(error)) {
+        autoActivationStatus = 'pending';
+        const delay = Math.min(60_000, 5_000 * 2 ** Math.min(autoActivationAttempt - 1, 3));
+        app.log.warn({ reason: autoActivationReason, retryInMs: delay }, 'automatic live trading activation pending');
+        scheduleAutoActivation(delay);
+      } else {
+        autoActivationStatus = 'blocked';
+        app.log.error({ reason: autoActivationReason }, 'automatic live trading activation blocked');
+      }
+    } finally {
+      autoActivationInFlight = false;
+    }
+  };
 
   const maintenanceResult = runDatabaseMaintenance(database);
   if (Object.values(maintenanceResult).some((deleted) => deleted > 0)) {
@@ -1025,12 +1141,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     // Bootstrap once per backend process. Concurrent UI tabs and a private-stream ready event
     // join the same single-flight request instead of multiplying five authenticated REST reads.
     triggerPortfolioRefresh();
+    if (config.autoActivateLive) scheduleAutoActivation(1_000);
   }
   app.addHook('onClose', async () => {
     await fundingHistoryService.stopBackground();
     await strategyEngine.stop();
     if (portfolioReconcileTimer) clearTimeout(portfolioReconcileTimer);
     if (databaseMaintenanceTimer) clearInterval(databaseMaintenanceTimer);
+    if (autoActivationTimer) clearTimeout(autoActivationTimer);
     livePortfolio.stop();
     marketHub.stop();
     privateStream.stop();
@@ -1064,6 +1182,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       database: databaseStatus.state,
       apiDocsRetrievedAt: API_DOCS_RETRIEVED_AT,
       connectionState: databaseStatus.state === 'ok' ? marketConnectionState === 'disconnected' ? 'healthy' : marketConnectionState : 'degraded',
+      autoActivation: {
+        enabled: config.autoActivateLive,
+        status: autoActivationStatus,
+        reason: autoActivationReason,
+      },
     };
   });
 
@@ -1074,6 +1197,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       mode: 'live',
       authenticatedTradingEnabled: tradingSession.liveTradingEnabled,
       tradingMode: tradingSession.current,
+      autoActivation: autoActivationSnapshot(),
       docs: { apiVersion: API_DOCS_VERSION, retrievedAt: API_DOCS_RETRIEVED_AT },
       database: {
         migrationCount: databaseStatus.migrationCount,
@@ -1332,26 +1456,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       if (parsed.data.mode === previous) return { mode: previous };
 
       if (parsed.data.mode === 'live') {
-        const credentials = await credentialVault.get(DEFAULT_CREDENTIAL_PROFILE);
-        if (!credentials) return reply.code(409).send({ error: 'credential_not_configured' });
         try {
-          const account = await crossExGateway.queryAccount(credentials);
-          const verifiedAt = new Date().toISOString();
-          const profileId = activeCredentialProfileId ?? DEFAULT_CREDENTIAL_PROFILE;
-          const existing = getCredentialMetadata(database, profileId);
-          const provider = await credentialVault.getProvider(DEFAULT_CREDENTIAL_PROFILE) ?? credentialVault.provider;
-          upsertCredentialMetadata(database, {
-            id: profileId,
-            label: existing?.label ?? (provider === 'env_file' ? 'Gate CrossEx (.env)' : 'Gate CrossEx'),
-            provider,
-            createdAt: existing?.createdAt ?? verifiedAt,
-            lastVerifiedAt: verifiedAt,
-          });
-          addAuditEvent(database, 'live_mode_credential_verified', {
-            profile: profileId,
-            accountMode: account.account_mode,
-          });
-          await strategyEngine.prepareForLiveActivation();
+          await verifyAndPrepareLiveActivation();
         } catch (error) {
           if (error instanceof StrategyEngineError || error instanceof TradingRuntimeError) {
             if (error.code === 'strategy_recovery_unresolved') {
@@ -1379,8 +1485,18 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       const mode = tradingSession.set(parsed.data.mode);
       let unresolvedOrders: UnresolvedOrder[] = [];
       if (mode === 'readonly') {
+        if (config.autoActivateLive && previous !== mode) {
+          autoActivationStatus = 'blocked';
+          autoActivationReason = 'manual_readonly_lock';
+          if (autoActivationTimer) clearTimeout(autoActivationTimer);
+        }
         unresolvedOrders = unresolvedOrderDetails(await strategyEngine.suspendForTradingLock());
       } else {
+        if (config.autoActivateLive) {
+          autoActivationStatus = 'live';
+          autoActivationReason = null;
+          if (autoActivationTimer) clearTimeout(autoActivationTimer);
+        }
         strategyEngine.activatePersistedStrategies(activeCredentialProfileId);
       }
       if (mode !== previous) {

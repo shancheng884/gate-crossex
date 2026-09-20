@@ -14,6 +14,8 @@ const chineseResultText: Record<string, string> = {
   'Submitting reduce-only market orders': '正在提交只减仓市价单',
   'Monitoring live premium': '正在监控实时溢价',
   'Monitoring live spreads': '正在监控实时价差',
+  'Waiting for executable premium to reach the next tier': '等待可成交溢价达到下一档',
+  'Waiting for executable premium to reach the entry level': '等待可成交溢价达到入场线',
   'Both legs fully executed and hedged': '两条分腿均已完全执行并完成对冲',
   'All opened exposure was closed; this strategy will not re-enter': '所有已开敞口均已平仓；该策略不会再次入场',
   'Order rejected for insufficient margin; strategy stopped retrying until manually reviewed': '订单因保证金不足被拒绝；策略已停止重试，请人工检查',
@@ -44,6 +46,18 @@ export function localizeStrategyLogResult(result: string, language: StrategyLogL
     .replace(/^Stopped with unhedged residual (.+); review positions$/i, '已停止，存在未对冲剩余敞口 $1；请检查持仓')
     .replace(/^Hedge quantity (.+) rounds below the (.+) lot size; raise per-order quantity$/i, '对冲数量 $1 按步长取整后低于 $2 的最小下单量；请提高每单数量')
     .replace(/^Unable to hedge residual exposure of (.+) after 3 attempts; manual review required$/i, '三次尝试后仍无法对冲剩余敞口 $1；需要人工检查')
+    .replace(/^Fresh executable entry quotes required$/i, '需要新鲜的可成交入场报价')
+    .replace(/^Premium (.+) tier (\d+) entry (.+)$/i, '溢价 $1 第 $2 档入场线 $3')
+    .replace(/^Premium (.+) entry (.+)$/i, '溢价 $1 入场线 $2')
+    .replace(/^Fresh executable entry quotes unavailable · /i, '暂无可成交入场报价 · ')
+    .replace(/^market feed state (.+)$/i, '行情连接状态 $1')
+    .replace(/^missing quote (.+)$/i, '缺少行情报价 $1')
+    .replace(/^unsupported quote source (.+)$/i, '行情来源不可用 $1')
+    .replace(/^invalid quote timestamps (.+)$/i, '行情时间戳无效 $1')
+    .replace(/^(.+) quote is (\d+)ms old$/i, '$1 行情已过期 $2 毫秒')
+    .replace(/^(.+) quote is (\d+)ms ahead of local clock$/i, '$1 行情领先本机时钟 $2 毫秒')
+    .replace(/^(.+) transport lag is (\d+)ms$/i, '$1 行情传输延迟 $2 毫秒')
+    .replace(/^fresh executable quotes unavailable$/i, '暂无新鲜的可成交报价')
     .replace(/^(.+) remaining$/i, '剩余 $1');
 
   return localized

@@ -82,6 +82,24 @@ function processExists(pid) {
 }
 
 /**
+ * Windows reuses process ids. A stale runtime.json must not make a newly assigned,
+ * unrelated pid look like a surviving Gate CrossEx process (or become a taskkill target).
+ */
+function windowsProcessBelongsToApp(pid) {
+  if (!isWindows || !processExists(pid)) return false;
+  const query = spawnSync('powershell.exe', [
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue).CommandLine`,
+  ], { encoding: 'utf8', windowsHide: true });
+  if (query.status !== 0) return false;
+  const commandLine = String(query.stdout ?? '').trim().toLowerCase().replaceAll('/', '\\');
+  const normalizedRoot = root.toLowerCase().replaceAll('/', '\\');
+  return commandLine.includes(normalizedRoot);
+}
+
+/**
  * Children are spawned as detached process-group leaders, so the group id stays killable even
  * after npm (the leader) or the launcher itself has died — the tsx/vite grandchildren that used
  * to be orphaned are members of the same group.
@@ -97,6 +115,7 @@ function groupExists(pid) {
 }
 
 function recordedProcessAlive(pid) {
+  if (isWindows) return windowsProcessBelongsToApp(pid);
   return groupExists(pid) || processExists(pid);
 }
 
@@ -116,7 +135,7 @@ function signalTree(pid, signal) {
 
 /** Never signal a recycled pid that now belongs to an unrelated process. */
 function safeToSignalGroup(pid) {
-  if (isWindows) return processExists(pid);
+  if (isWindows) return windowsProcessBelongsToApp(pid);
   if (!groupExists(pid)) return false;
   // Leader dead but the group lives on: surviving members inherited our group id — ours.
   if (!processExists(pid)) return true;

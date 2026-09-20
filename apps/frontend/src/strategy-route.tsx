@@ -68,6 +68,12 @@ import { numericFutureFeeRate } from './fee-rates.js';
 const PremiumHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.PremiumHistoryChart })));
 const PriceDifferenceHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.PriceDifferenceHistoryChart })));
 const FundingHistoryChart = lazy(() => import('./charts.js').then((module) => ({ default: module.FundingHistoryChart })));
+type PremiumGridTierDraft = { entryPremiumPct: string; quantity: string; takeProfitPremiumPct: string };
+const DEFAULT_PREMIUM_GRID_TIERS: PremiumGridTierDraft[] = [
+  { entryPremiumPct: '39.5', quantity: '0.10', takeProfitPremiumPct: '39.0' },
+  { entryPremiumPct: '40.5', quantity: '0.10', takeProfitPremiumPct: '39.5' },
+  { entryPremiumPct: '41.5', quantity: '0.10', takeProfitPremiumPct: '40.0' },
+];
 const HISTORICAL_STRATEGIES_PAGE_SIZE = 10;
 const POSITION_FUNDING_RANGES = [
   { days: 1, label: '24H' },
@@ -1233,6 +1239,8 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const [entryPremium, setEntryPremium] = useState('35');
   const [takeProfitPremium, setTakeProfitPremium] = useState('24');
   const [maxPosition, setMaxPosition] = useState('');
+  const [grid, setGrid] = useState(false);
+  const [gridTiers, setGridTiers] = useState<PremiumGridTierDraft[]>(DEFAULT_PREMIUM_GRID_TIERS);
   const [reduceOnly, setReduceOnly] = useState(false);
   const [hedgeMode, setHedgeMode] = useState<'SHARE_RATIO' | 'EQUAL_NOTIONAL'>('EQUAL_NOTIONAL');
   const [adrLeverage, setAdrLeverage] = useState('3');
@@ -1407,8 +1415,13 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
           : 'A selected quote was delayed by more than 3 seconds; waiting for a timely update.');
   const adrLive = displayPair?.left ?? null;
   const hedgeLive = displayPair?.right ?? null;
-  const adrPrice = Number(adrLive?.lastPrice ?? 0);
-  const hedgePrice = Number(hedgeLive?.lastPrice ?? 0);
+  const shortPremium = !directionFlipped;
+  // Keep the preview, entry-ready indicator, margin estimate, and hedge sizing aligned with the
+  // strategy engine. A short-premium entry sells the ADR at bid and buys the hedge at ask; the
+  // reverse applies when the direction is flipped. Last trade prices can look profitable while
+  // the executable two-leg premium is still below the configured trigger.
+  const adrPrice = Number((shortPremium ? adrLive?.bidPrice : adrLive?.askPrice) ?? 0);
+  const hedgePrice = Number((shortPremium ? hedgeLive?.askPrice : hedgeLive?.bidPrice) ?? 0);
   const ratioNumber = Number(adrRatio) || 0;
   // One hedge share converts to `ratio` ADR shares, so fair ADR value = hedge price ÷ ratio.
   const fairValue = ratioNumber > 0 ? hedgePrice / ratioNumber : 0;
@@ -1455,7 +1468,6 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     : historyStatus === 'failed'
       ? t('Premium history unavailable')
       : t('No overlapping candles for this venue pair.');
-  const shortPremium = !directionFlipped;
   const adrSide = shortPremium ? 'Sell' : 'Buy';
   const hedgeSide = shortPremium ? 'Buy' : 'Sell';
   const tradingEnabled = tradingMode === 'live';
@@ -1466,7 +1478,8 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const hedgeBalanceUnit = balanceUnitFor(authenticatedPortfolio, hedgeExchange.id);
   const adrPortfolioPosition = authenticatedPortfolio?.snapshot.futuresPositions?.find((position) => position.symbol === adrSymbol);
   const hedgePortfolioPosition = authenticatedPortfolio?.snapshot.futuresPositions?.find((position) => position.symbol === hedgeSymbol);
-  const configuredMaxPosition = Number(maxPosition) || 0;
+  const gridTotalPosition = gridTiers.reduce((sum, tier) => sum + (Number(tier.quantity) || 0), 0);
+  const configuredMaxPosition = grid ? gridTotalPosition : Number(maxPosition) || 0;
   const adrLeverageNumber = Number(adrLeverage) || 0;
   const hedgeLeverageNumber = Number(hedgeLeverage) || 0;
   const leverageInvalid = !reduceOnly && (adrLeverageNumber < 1 || adrLeverageNumber > 200
@@ -1530,7 +1543,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   // Share-ratio hedges are exact (per-order ÷ ratio); equal-notional hedges are sized at each
   // clip's execution prices, so the preview from current prices is an estimate.
   const hedgePerOrderText = (() => {
-    const perOrderNumber = Number(perOrderQuantity) || 0;
+    const perOrderNumber = grid ? Number(gridTiers[0]?.quantity) || 0 : Number(perOrderQuantity) || 0;
     if (!(perOrderNumber > 0)) return null;
     if (hedgeMode === 'EQUAL_NOTIONAL') {
       if (!(adrPrice > 0) || !(hedgePrice > 0)) return null;
@@ -1539,17 +1552,29 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     if (!(ratioNumber > 0)) return null;
     return `${Number((perOrderNumber / ratioNumber).toFixed(8))} ${ADR_HEDGE_ASSET}`;
   })();
-  const perOrderNumber = Number(perOrderQuantity);
-  const hedgePerOrderNumber = hedgeMode === 'EQUAL_NOTIONAL'
-    ? adrPrice > 0 && hedgePrice > 0 ? perOrderNumber * adrPrice / hedgePrice : 0
-    : ratioNumber > 0 ? perOrderNumber / ratioNumber : 0;
-  const premiumSizeIssues = [
-    minimumSizeIssue(adrInstrument, perOrderNumber, adrExchange.name, ADR_ASSET, t),
-    minimumSizeIssue(hedgeInstrument, hedgePerOrderNumber, hedgeExchange.name, ADR_HEDGE_ASSET, t),
-  ].filter((issue): issue is string => issue !== null);
+  const premiumSizeIssues = (grid ? gridTiers : [{ quantity: perOrderQuantity }]).flatMap((tier, index) => {
+    const tierQuantity = Number(tier.quantity) || 0;
+    const tierHedgeQuantity = hedgeMode === 'EQUAL_NOTIONAL'
+      ? adrPrice > 0 && hedgePrice > 0 ? tierQuantity * adrPrice / hedgePrice : 0
+      : ratioNumber > 0 ? tierQuantity / ratioNumber : 0;
+    return [
+      minimumSizeIssue(adrInstrument, tierQuantity, adrExchange.name, `${ADR_ASSET} ${grid ? `(${index + 1})` : ''}`, t),
+      minimumSizeIssue(hedgeInstrument, tierHedgeQuantity, hedgeExchange.name, `${ADR_HEDGE_ASSET} ${grid ? `(${index + 1})` : ''}`, t),
+    ].filter((issue): issue is string => issue !== null);
+  });
   const premiumInstrumentsReady = adrInstrument !== undefined && hedgeInstrument !== undefined;
-  const premiumInputsValid = isPositiveDecimal(perOrderQuantity)
-    && isPositiveDecimal(maxPosition)
+  const gridTiersValid = gridTiers.length > 0 && gridTiers.every((tier, index) => {
+    const entry = Number(tier.entryPremiumPct);
+    const takeProfit = Number(tier.takeProfitPremiumPct);
+    const quantity = Number(tier.quantity);
+    const ordered = index === 0 || (shortPremium ? entry > Number(gridTiers[index - 1]?.entryPremiumPct) : entry < Number(gridTiers[index - 1]?.entryPremiumPct));
+    const profitable = shortPremium ? takeProfit < entry : takeProfit > entry;
+    return Number.isFinite(entry) && Number.isFinite(takeProfit) && Number.isFinite(quantity)
+      && quantity > 0 && ordered && profitable;
+  });
+  const premiumInputsValid = (grid
+    ? gridTiersValid && gridTotalPosition > 0
+    : isPositiveDecimal(perOrderQuantity) && isPositiveDecimal(maxPosition))
     && premiumInstrumentsReady
     && premiumSizeIssues.length === 0;
   const premiumReviewValid = premiumInputsValid
@@ -1557,7 +1582,9 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   const entryComparator = shortPremium ? '≥' : '≤';
   const exitComparator = shortPremium ? '≤' : '≥';
   const entryReady = livePair !== null && premiumNow !== null
-    && (shortPremium ? premiumNow >= Number(entryPremium) : premiumNow <= Number(entryPremium));
+    && (grid
+      ? gridTiers.some((tier) => shortPremium ? premiumNow >= Number(tier.entryPremiumPct) : premiumNow <= Number(tier.entryPremiumPct))
+      : shortPremium ? premiumNow >= Number(entryPremium) : premiumNow <= Number(entryPremium));
   const premiumLaunchReady = livePair !== null && !marginInsufficient && !leverageInvalid && premiumReviewValid;
 
   useEffect(() => setHoveredPremium(null), [historySeriesKey]);
@@ -1575,12 +1602,16 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
       rightVenue: hedgeExchange.id.toUpperCase(),
       leftSide: shortPremium ? 'SELL' : 'BUY',
       rightSide: shortPremium ? 'BUY' : 'SELL',
-      entryPremiumPct: entryPremium,
+      entryPremiumPct: grid ? gridTiers[0]?.entryPremiumPct ?? entryPremium : entryPremium,
       hedgeMode,
-      perOrderQuantity,
+      perOrderQuantity: grid ? gridTiers[0]?.quantity ?? perOrderQuantity : perOrderQuantity,
       reduceOnly,
       executionMethod: 'TAKER_TAKER',
-      maxPosition,
+      maxPosition: grid ? String(gridTotalPosition) : maxPosition,
+      ...(grid ? {
+        grid: true,
+        gridTiers: gridTiers.map((tier) => ({ ...tier })),
+      } : {}),
       ...(!reduceOnly ? {
         leftLeverage: adrLeverage,
         rightLeverage: hedgeLeverage,
@@ -1687,10 +1718,22 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
         <article className="strategy-panel strategy-rules compact strategy-rules-sidebar terminal-panel">
           <header className="strategy-panel-head"><div><p className="eyebrow">{t('Strategy setup')}</p><h2>{t('Configure premium bot')}</h2></div></header>
           <div className="compact-fields">
-            <label><span>{t('Per-order quantity')}</span><div><input placeholder="e.g. 0.10" value={perOrderQuantity} onChange={(event) => setPerOrderQuantity(event.target.value)} /><b>{ADR_ASSET}</b></div></label>
-            <label><span>{t(reduceOnly ? 'Max close amount' : 'Max position')}</span><div><input placeholder="e.g. 0.50" value={maxPosition} onChange={(event) => setMaxPosition(event.target.value)} /><b>{ADR_ASSET}</b></div></label>
-            <label><span>{t('Entry premium')}</span><div><input value={entryPremium} onChange={(event) => setEntryPremium(event.target.value)} /><b>%</b></div></label>
-            <label className={reduceOnly ? 'inactive-for-reduce-only' : ''}><span>{t('Take-profit premium')}</span><div><input value={takeProfitPremium} onChange={(event) => setTakeProfitPremium(event.target.value)} disabled={reduceOnly} /><b>%</b></div></label>
+            {!grid ? <>
+              <label><span>{t('Per-order quantity')}</span><div><input placeholder="e.g. 0.10" value={perOrderQuantity} onChange={(event) => setPerOrderQuantity(event.target.value)} /><b>{ADR_ASSET}</b></div></label>
+              <label><span>{t(reduceOnly ? 'Max close amount' : 'Max position')}</span><div><input placeholder="e.g. 0.50" value={maxPosition} onChange={(event) => setMaxPosition(event.target.value)} /><b>{ADR_ASSET}</b></div></label>
+              <label><span>{t('Entry premium')}</span><div><input value={entryPremium} onChange={(event) => setEntryPremium(event.target.value)} /><b>%</b></div></label>
+              <label className={reduceOnly ? 'inactive-for-reduce-only' : ''}><span>{t('Take-profit premium')}</span><div><input value={takeProfitPremium} onChange={(event) => setTakeProfitPremium(event.target.value)} disabled={reduceOnly} /><b>%</b></div></label>
+            </> : <div className="premium-grid-editor">
+              <div className="premium-grid-title"><span>{t('Gradient entry')}</span><small>{t('Each tier has its own entry, quantity and take profit')}</small></div>
+              <div className="premium-grid-head"><span>{t('Entry')}</span><span>{t('Quantity')}</span><span>{t('Take profit')}</span><i /></div>
+              {gridTiers.map((tier, index) => <div className="premium-grid-row" key={index}>
+                <label><input aria-label={`${t('Entry')} ${index + 1}`} value={tier.entryPremiumPct} onChange={(event) => setGridTiers((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, entryPremiumPct: event.target.value } : item))} /><b>%</b></label>
+                <label><input aria-label={`${t('Quantity')} ${index + 1}`} value={tier.quantity} onChange={(event) => setGridTiers((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, quantity: event.target.value } : item))} /><b>{ADR_ASSET}</b></label>
+                <label><input aria-label={`${t('Take profit')} ${index + 1}`} value={tier.takeProfitPremiumPct} onChange={(event) => setGridTiers((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, takeProfitPremiumPct: event.target.value } : item))} /><b>%</b></label>
+                <button type="button" aria-label={`${t('Remove tier')} ${index + 1}`} onClick={() => setGridTiers((current) => current.length > 1 ? current.filter((_, itemIndex) => itemIndex !== index) : current)}>×</button>
+              </div>)}
+              <button type="button" className="premium-grid-add" onClick={() => setGridTiers((current) => [...current, { entryPremiumPct: '', quantity: '', takeProfitPremiumPct: '' }])}>+ {t('Add tier')}</button>
+            </div>}
             <StrategyLeverageControl label="SKHY leverage" symbol={adrSymbol} exchangeName={adrExchange.name}
               asset={ADR_ASSET} quote={quoteFor(adrVenueId)} value={adrLeverage} referencePrice={adrPrice}
               fallbackCurrent={adrPortfolioPosition?.leverage} fallbackMax={adrPortfolioPosition?.maxLeverage}
@@ -1709,8 +1752,11 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
           <div className="strategy-setup-actions">
             <div className="compact-trigger"><span className={entryReady ? 'ready' : ''}>{entryReady ? '✓' : '○'}</span><p>{reduceOnly
               ? <>{t('Reduce existing positions at')} <strong>{entryComparator} {entryPremium || '0'}%</strong></>
-              : <>{t('Enter at')} <strong>{entryComparator} {entryPremium || '0'}%</strong> · {t('Take profit at')} <strong>{exitComparator} {takeProfitPremium || '0'}%</strong></>}</p></div>
-            <label className="reduce-only-control premium-reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Position handling')}</span><div><input type="checkbox" checked={reduceOnly} onChange={(event) => setReduceOnly(event.target.checked)} /><b>{t('Reduce only')}</b></div></label>
+              : grid
+                ? <>{t('Gradient opening')} <strong>{gridTiers.length} {t('tiers')}</strong> · {t('Take profit per tier')}</>
+                : <>{t('Enter at')} <strong>{entryComparator} {entryPremium || '0'}%</strong> · {t('Take profit at')} <strong>{exitComparator} {takeProfitPremium || '0'}%</strong></>}</p></div>
+            <label className="reduce-only-control premium-reduce-only-control"><span onClick={(event) => event.preventDefault()}>{t('Position handling')}</span><div><input type="checkbox" checked={reduceOnly} onChange={(event) => { const next = event.target.checked; setReduceOnly(next); if (next) setGrid(false); }} /><b>{t('Reduce only')}</b></div></label>
+            {!reduceOnly && <label className="reduce-only-control premium-reduce-only-control premium-grid-toggle"><span>{t('Opening mode')}</span><div><input type="checkbox" checked={grid} onChange={(event) => setGrid(event.target.checked)} /><b>{t('Gradient opening')}</b></div></label>}
             <div className="compact-method premium-hedge-sizing"><span>{t('Hedge sizing')}</span>
               <div className="method-options maker-leg-picker hedge-sizing-options" role="group" aria-label={t('Hedge sizing')}>
                 <button type="button" aria-pressed={hedgeMode === 'EQUAL_NOTIONAL'} className={hedgeMode === 'EQUAL_NOTIONAL' ? 'active' : ''} onClick={() => setHedgeMode('EQUAL_NOTIONAL')}><small>{t('Equal notional')}</small><strong>{t('Match value at entry')}</strong></button>
@@ -1724,11 +1770,11 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
           <div className="launch-status"><span><i />{t('Review & launch')}</span><small>{t(reduceOnly ? 'Reduce only' : 'One cycle')}</small></div>
           <div className="launch-intent"><div><small>{t('Strategy')}</small><strong>{t(reduceOnly ? 'Reduce existing positions' : shortPremium ? 'Short premium' : 'Long premium')}</strong></div><p><span className={adrSide.toLowerCase()}>{t(adrSide)} {ADR_ASSET} · {adrExchange.name}</span><i>⇄</i><span className={hedgeSide.toLowerCase()}>{t(hedgeSide)} {ADR_HEDGE_ASSET} · {hedgeExchange.name}</span></p></div>
           <dl className="launch-summary review-grid">
-            <div><dt>{t(reduceOnly ? 'Trigger' : 'Entry')}</dt><dd>{entryComparator} {entryPremium || '0'}%</dd></div>
-            {!reduceOnly && <div><dt>{t('Take profit')}</dt><dd>{exitComparator} {takeProfitPremium || '0'}%</dd></div>}
-            <div><dt>{t('Per order')}</dt><dd>{perOrderQuantity || '0'} {ADR_ASSET}</dd></div>
+            <div><dt>{t(reduceOnly ? 'Trigger' : 'Entry')}</dt><dd>{grid ? `${gridTiers.length} ${t('tiers')}` : `${entryComparator} ${entryPremium || '0'}%`}</dd></div>
+            {!reduceOnly && <div><dt>{t('Take profit')}</dt><dd>{grid ? t('Per tier') : `${exitComparator} ${takeProfitPremium || '0'}%`}</dd></div>}
+            <div><dt>{t('Per order')}</dt><dd>{grid ? t('Configured in each tier') : `${perOrderQuantity || '0'} ${ADR_ASSET}`}</dd></div>
             <div><dt>{t('Hedge per order')}</dt><dd>{hedgePerOrderText ?? '—'}</dd></div>
-            <div><dt>{t(reduceOnly ? 'Max close amount' : 'Max position')}</dt><dd>{maxPosition || '0'} {ADR_ASSET}</dd></div>
+            <div><dt>{t(reduceOnly ? 'Max close amount' : 'Max position')}</dt><dd>{grid ? `${gridTotalPosition || 0} ${ADR_ASSET}` : `${maxPosition || '0'} ${ADR_ASSET}`}</dd></div>
             {!reduceOnly && <div><dt>{t('Leverage')}</dt><dd>{adrLeverage || '—'}× / {hedgeLeverage || '—'}×</dd></div>}
             {!reduceOnly && <div><dt>{t('Max position at selected leverage')}</dt><dd>{adrRiskPositionValue !== null && adrRiskPositionValue !== undefined ? formatAmount(adrRiskPositionValue) : '—'} {quoteFor(adrVenueId)} / {hedgeRiskPositionValue !== null && hedgeRiskPositionValue !== undefined ? formatAmount(hedgeRiskPositionValue) : '—'} {quoteFor(hedgeVenueId)}</dd></div>}
             {!reduceOnly && <div><dt>{t('Projected position')}</dt><dd>{projectedAdrPositionValue !== null ? formatAmount(projectedAdrPositionValue) : '—'} {quoteFor(adrVenueId)} / {projectedHedgePositionValue !== null ? formatAmount(projectedHedgePositionValue) : '—'} {quoteFor(hedgeVenueId)}</dd></div>}
@@ -1747,10 +1793,10 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
       market={`${ADR_ASSET} / ${ADR_HEDGE_ASSET} · ${adrExchange.name} ⇄ ${hedgeExchange.name}`}
       rows={[
         { label: t('Direction'), value: `${t(adrSide)} ${ADR_ASSET} ⇄ ${t(hedgeSide)} ${ADR_HEDGE_ASSET}` },
-        { label: t(reduceOnly ? 'Trigger' : 'Entry'), value: `${entryComparator} ${entryPremium || '0'}%` },
-        ...(!reduceOnly ? [{ label: t('Take profit'), value: `${exitComparator} ${takeProfitPremium || '0'}%` }] : []),
-        { label: t(reduceOnly ? 'Max close amount' : 'Max position'), value: `${maxPosition} ${ADR_ASSET}` },
-        { label: t('Per order'), value: `${perOrderQuantity} ${ADR_ASSET}` },
+        { label: t(reduceOnly ? 'Trigger' : 'Entry'), value: grid ? `${gridTiers.length} ${t('tiers')}` : `${entryComparator} ${entryPremium || '0'}%` },
+        ...(!reduceOnly ? [{ label: t('Take profit'), value: grid ? t('Per tier') : `${exitComparator} ${takeProfitPremium || '0'}%` }] : []),
+        { label: t(reduceOnly ? 'Max close amount' : 'Max position'), value: `${grid ? gridTotalPosition : maxPosition} ${ADR_ASSET}` },
+        { label: t('Per order'), value: grid ? t('Configured in each tier') : `${perOrderQuantity} ${ADR_ASSET}` },
         { label: t('Hedge per order'), value: hedgePerOrderText ?? '—' },
         ...(!reduceOnly ? [{ label: t('Leverage'), value: `${adrLeverage}× / ${hedgeLeverage}×` }] : []),
         { label: t('Hedge sizing'), value: t(hedgeMode === 'EQUAL_NOTIONAL' ? 'Equal notional' : 'Share ratio') },

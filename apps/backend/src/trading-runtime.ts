@@ -54,6 +54,12 @@ export const CreateStrategyInputSchema = z.object({
   grid: z.boolean().default(false),
   gridStepPct: decimalText.optional(),
   gridLevels: z.number().int().min(1).max(30).optional(),
+  /** Explicit premium ladder. Each quantity is in left/ADR units. */
+  gridTiers: z.array(z.object({
+    entryPremiumPct: signedDecimalText,
+    takeProfitPremiumPct: signedDecimalText,
+    quantity: decimalText,
+  })).min(1).max(30).optional(),
   totalAmount: decimalText.optional(),
   maxPosition: decimalText.optional(),
   perOrderQuantity: decimalText,
@@ -95,7 +101,30 @@ export const CreateStrategyInputSchema = z.object({
     if (value.entryPremiumPct === undefined) context.addIssue({ code: 'custom', path: ['entryPremiumPct'], message: 'entry premium is required' });
     if (value.executionMethod !== 'TAKER_TAKER') context.addIssue({ code: 'custom', path: ['executionMethod'], message: 'premium strategies execute taker-taker' });
     if (value.grid) {
-      if (!value.gridStepPct || value.gridLevels === undefined) context.addIssue({ code: 'custom', path: ['gridStepPct'], message: 'grid step and levels are required' });
+      if (!value.gridTiers && (!value.gridStepPct || value.gridLevels === undefined)) {
+        context.addIssue({ code: 'custom', path: ['gridTiers'], message: 'grid tiers or legacy grid step and levels are required' });
+      }
+      const tiers = value.gridTiers;
+      if (tiers) {
+        let previousEntry: Decimal | null = null;
+        for (const [index, tier] of tiers.entries()) {
+          const entry = new Decimal(tier.entryPremiumPct);
+          const takeProfit = new Decimal(tier.takeProfitPremiumPct);
+          if (value.leftSide === 'SELL' && takeProfit.gte(entry)) {
+            context.addIssue({ code: 'custom', path: ['gridTiers', index, 'takeProfitPremiumPct'], message: 'short-premium take profit must be below entry' });
+          }
+          if (value.leftSide === 'BUY' && takeProfit.lte(entry)) {
+            context.addIssue({ code: 'custom', path: ['gridTiers', index, 'takeProfitPremiumPct'], message: 'long-premium take profit must be above entry' });
+          }
+          if (previousEntry !== null && value.leftSide === 'SELL' && entry.lte(previousEntry)) {
+            context.addIssue({ code: 'custom', path: ['gridTiers', index, 'entryPremiumPct'], message: 'short-premium entry levels must increase' });
+          }
+          if (previousEntry !== null && value.leftSide === 'BUY' && entry.gte(previousEntry)) {
+            context.addIssue({ code: 'custom', path: ['gridTiers', index, 'entryPremiumPct'], message: 'long-premium entry levels must decrease' });
+          }
+          previousEntry = entry;
+        }
+      }
     } else {
       if (!value.reduceOnly && value.takeProfitPremiumPct === undefined) context.addIssue({ code: 'custom', path: ['takeProfitPremiumPct'], message: 'take-profit premium is required' });
       if (!value.maxPosition) context.addIssue({ code: 'custom', path: ['maxPosition'], message: 'max position is required' });

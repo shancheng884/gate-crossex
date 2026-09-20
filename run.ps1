@@ -35,8 +35,9 @@ function Get-Sha256([string]$FilePath) {
 }
 
 function Invoke-Npm {
-  if ($null -ne $NpmCli) { & $NodeCommand $NpmCli @args }
-  else { & npm @args }
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$NpmArgs)
+  if ($null -ne $NpmCli) { & $NodeCommand $NpmCli @NpmArgs }
+  else { & npm @NpmArgs }
   if ($LASTEXITCODE -ne 0) { throw "npm command failed with exit code $LASTEXITCODE" }
 }
 
@@ -111,8 +112,8 @@ function Offer-Update {
   if ($Versions.Count -ne 2) { return }
 
   Write-Host "Gate CrossEx $($Versions[1]) is available (installed: v$($Versions[0]))."
-  Write-Host "Gate CrossEx $($Versions[1]) 有新版本可用（当前版本：v$($Versions[0])）。"
-  $Answer = Read-Host 'Update now? / 是否立即更新？ [y/N]'
+  Write-Host "A newer Gate CrossEx version is available."
+  $Answer = Read-Host 'Update now? [y/N]'
   if ($Answer -notmatch '^(y|yes)$') {
     Write-Host 'Continuing without updating.'
     return
@@ -139,6 +140,11 @@ switch ($Command) {
   }
   { $_ -in "doctor", "stop", "logs" } {
     Invoke-Launcher $Command
+    break
+  }
+  "remote" {
+    & $NodeCommand scripts/remote-access.mjs
+    if ($LASTEXITCODE -ne 0) { throw "Gate CrossEx remote tunnel failed with exit code $LASTEXITCODE" }
     break
   }
   "reset" {
@@ -197,5 +203,5 @@ switch ($Command) {
     & $NodeCommand scripts/maintain-database.mjs .local-data/gate-crossex.sqlite
     break
   }
-  default { throw "Usage: ./run.ps1 [dev|doctor|stop|logs|reset|update|backup|restore|maintenance] [path]" }
+  default { throw "Usage: ./run.ps1 [start|remote|dev|doctor|stop|logs|reset|update|backup|restore|maintenance] [path]" }
 }

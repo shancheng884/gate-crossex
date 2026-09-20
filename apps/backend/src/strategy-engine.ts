@@ -69,6 +69,7 @@ interface StrategyActor {
   failureCount: number;
   cooldownUntil: number;
   lastQuoteAt: number;
+  lastEntryDiagnosticAt: number;
   suspended: boolean;
   quiesceTarget: 'PAUSED' | 'STOPPED' | null;
   quiesceReason: string | null;
@@ -100,6 +101,32 @@ const RUNG_EPSILON = new Decimal('1e-9');
 const BPS = new Decimal(10_000);
 /** Keep dust-repair orders clear of a moving venue's exact minimum-notional boundary. */
 const MIN_NOTIONAL_REPAIR_BUFFER = new Decimal('1.1');
+
+interface PremiumGridTierDecimal {
+  entryPremiumPct: Decimal;
+  takeProfitPremiumPct: Decimal;
+  quantity: Decimal;
+}
+
+function premiumGridTiers(config: CreateStrategyInput): PremiumGridTierDecimal[] {
+  if (config.gridTiers?.length) {
+    return config.gridTiers.map((tier) => ({
+      entryPremiumPct: new Decimal(tier.entryPremiumPct),
+      takeProfitPremiumPct: new Decimal(tier.takeProfitPremiumPct),
+      quantity: new Decimal(tier.quantity),
+    }));
+  }
+  const levels = config.gridLevels ?? 0;
+  const base = new Decimal(config.entryPremiumPct ?? '0');
+  const step = new Decimal(config.gridStepPct ?? '0');
+  const quantity = new Decimal(config.perOrderQuantity);
+  return Array.from({ length: levels }, (_, index) => {
+    const rung = new Decimal(index);
+    const entryPremiumPct = config.leftSide === 'SELL' ? base.plus(step.mul(rung)) : base.minus(step.mul(rung));
+    const takeProfitPremiumPct = config.leftSide === 'SELL' ? entryPremiumPct.minus(step) : entryPremiumPct.plus(step);
+    return { entryPremiumPct, takeProfitPremiumPct, quantity };
+  });
+}
 
 function symbolFor(venue: string, asset: string): string {
   const quote = venue === 'KRAKEN' ? 'USD' : venue === 'HYPERLIQUID' || venue === 'DERIBIT' ? 'USDC' : 'USDT';
@@ -423,11 +450,6 @@ export class StrategyEngine {
     account: { profileId: string; label: string } | null = null,
   ): Promise<StrategyRecord> {
     const input = CreateStrategyInputSchema.parse(raw);
-    // Grid strategies remain readable/resumable for historical compatibility, but the product no
-    // longer allows creating new premium grids.
-    if (input.kind === 'premium' && input.grid) {
-      throw new StrategyEngineError('premium_grid_mode_removed', 400);
-    }
     if (input.kind === 'auto' && input.takeProfitBps && input.entryBps && new Decimal(input.takeProfitBps).gte(new Decimal(input.entryBps))) {
       throw new StrategyEngineError('take_profit_must_be_below_entry', 400);
     }
@@ -483,7 +505,9 @@ export class StrategyEngine {
       ? `${input.closePlan.orderCount} reduce-only slices · ${input.closePlan.intervalSeconds}s interval`
       : input.kind === 'premium'
       ? input.grid
-        ? `Grid ${input.gridLevels} × ${input.gridStepPct}% from ${input.entryPremiumPct}% premium · ${hedgeModeLabel}`
+        ? input.gridTiers
+          ? `${input.gridTiers.length}-tier premium ladder · ${hedgeModeLabel}`
+          : `Grid ${input.gridLevels} × ${input.gridStepPct}% from ${input.entryPremiumPct}% premium · ${hedgeModeLabel}`
         : input.reduceOnly
           ? `Reduce existing positions at ${shortPremium ? '≥' : '≤'} ${input.entryPremiumPct}% premium · ${hedgeModeLabel}`
           : `Enter ${shortPremium ? '≥' : '≤'} ${input.entryPremiumPct}% · exit ${shortPremium ? '≤' : '≥'} ${input.takeProfitPremiumPct}% premium · ${hedgeModeLabel}`
@@ -685,6 +709,7 @@ export class StrategyEngine {
       id: record.id, config: record.config, kind: record.kind, status: record.status,
       busy: false, queue: Promise.resolve(), quotes: new Map(), repairAttempts: 0,
       lastRepairAt: 0, failureCount: 0, cooldownUntil: 0, lastQuoteAt: 0,
+      lastEntryDiagnosticAt: 0,
       suspended, quiesceTarget: null, quiesceReason: null, unresolvedOrders: [], createdAt: Date.parse(record.createdAt),
       lastCloseAt: Date.parse(record.updatedAt),
     };
@@ -787,6 +812,44 @@ export class StrategyEngine {
     return { left, right };
   }
 
+  private premiumEntryMarketDiagnostic(config: CreateStrategyInput): string {
+    const connectionState = this.markets.connectionState?.();
+    if (connectionState && connectionState !== 'healthy') return `market feed state ${connectionState}`;
+
+    const legs = legsOf(config);
+    for (const symbol of [legs.left.symbol, legs.right.symbol]) {
+      const market = this.markets.market(symbol);
+      if (!market) return `missing quote ${symbol}`;
+      if (market.source !== 'gate_crossex_websocket') return `unsupported quote source ${symbol}`;
+      const sourceTimestamp = Date.parse(market.updatedAt);
+      const receivedTimestamp = Date.parse(market.receivedAt);
+      const age = this.options.now() - sourceTimestamp;
+      const transportLag = receivedTimestamp - sourceTimestamp;
+      if (!Number.isFinite(age) || !Number.isFinite(transportLag)) return `invalid quote timestamps ${symbol}`;
+      if (age > this.options.marketFreshnessMs) return `${symbol} quote is ${Math.round(age)}ms old`;
+      if (age < -this.options.futureQuoteToleranceMs) {
+        return `${symbol} quote is ${Math.round(-age)}ms ahead of local clock`;
+      }
+      if (transportLag > this.options.marketMaxTransportLagMs) {
+        return `${symbol} transport lag is ${Math.round(transportLag)}ms`;
+      }
+    }
+    return 'fresh executable quotes unavailable';
+  }
+
+  private logEntryWaiting(
+    actor: StrategyActor,
+    condition: string,
+    quantity: Decimal,
+    result: string,
+  ): void {
+    const now = this.options.now();
+    if (now - actor.lastEntryDiagnosticAt < 15_000) return;
+    actor.lastEntryDiagnosticAt = now;
+    this.runtime.addStrategyLog(actor.id, 'info', 'Entry waiting', condition,
+      `${quantity.toString()} ${actor.config.asset}`, result);
+  }
+
   private strategyLedger(strategyId: string): StrategyLedgerCache {
     const cached = this.ledgerCache.get(strategyId);
     // Execution events invalidate immediately. This TTL provides periodic durable reconciliation
@@ -824,6 +887,18 @@ export class StrategyEngine {
     ledger.configKey = configKey;
     ledger.premiumExitStarted = started;
     return started;
+  }
+
+  /** Executed left-leg quantity assigned to one explicit ladder tier. */
+  private premiumGridTierExposure(actor: StrategyActor, tierIndex: number): Decimal {
+    const prefix = `grid-entry-${tierIndex}-`;
+    const exitPrefix = `grid-exit-${tierIndex}-`;
+    return this.strategyLedger(actor.id).rows
+      .filter((row) => row.leg === 'left' && (row.strategy_clip?.startsWith(prefix) || row.strategy_clip?.startsWith(exitPrefix)))
+      .reduce((sum, row) => {
+        const quantity = new Decimal(row.executed_quantity || '0');
+        return row.strategy_clip?.startsWith(exitPrefix) ? sum.minus(quantity) : sum.plus(quantity);
+      }, ZERO);
   }
 
   private equalNotional(config: CreateStrategyInput): boolean {
@@ -1009,11 +1084,15 @@ export class StrategyEngine {
   ): void {
     const perOrder = new Decimal(config.perOrderQuantity);
     const target = this.strategyTarget(config);
-    const firstClip = Decimal.min(perOrder, target);
-    const remainder = target.mod(perOrder);
-    const leftClips = remainder.gt(QUANTITY_EPSILON) && !remainder.eq(firstClip)
-      ? [firstClip, remainder]
-      : [firstClip];
+    const leftClips = config.kind === 'premium' && config.grid
+      ? premiumGridTiers(config).map((tier) => tier.quantity)
+      : (() => {
+        const firstClip = Decimal.min(perOrder, target);
+        const remainder = target.mod(perOrder);
+        return remainder.gt(QUANTITY_EPSILON) && !remainder.eq(firstClip)
+          ? [firstClip, remainder]
+          : [firstClip];
+      })();
 
     let equalNotionalRatio: Decimal | null = null;
     if (this.equalNotional(config)) {
@@ -1186,7 +1265,7 @@ export class StrategyEngine {
   private strategyTarget(config: CreateStrategyInput): Decimal {
     if (config.kind === 'position') return new Decimal(config.totalAmount ?? '0');
     if (config.kind === 'premium' && config.grid) {
-      return new Decimal(config.perOrderQuantity).mul(config.gridLevels ?? 0);
+      return premiumGridTiers(config).reduce((sum, tier) => sum.plus(tier.quantity), ZERO);
     }
     return new Decimal(config.maxPosition ?? '0');
   }
@@ -1436,7 +1515,9 @@ export class StrategyEngine {
   private async evaluatePremiumClip(actor: StrategyActor): Promise<void> {
     const config = actor.config;
     const exposure = this.legExposures(actor.id, config);
-    if (this.premiumExitStarted(actor)) {
+    const exitStarted = this.premiumExitStarted(actor);
+    const explicitGrid = Boolean(config.grid && config.gridTiers?.length);
+    if (exitStarted && (!config.grid || !explicitGrid)) {
       await this.ensurePremiumFlat(actor, exposure);
       return;
     }
@@ -1446,6 +1527,7 @@ export class StrategyEngine {
     const shortPremium = config.leftSide === 'SELL';
     const entryLevel = new Decimal(config.entryPremiumPct ?? '0');
     const step = config.grid ? new Decimal(config.gridStepPct ?? '0') : ZERO;
+    const tiers = explicitGrid ? premiumGridTiers(config) : [];
     const target = this.strategyTarget(config);
     const inFlight = this.inFlightQuantity(actor, new Set());
     const capacity = Decimal.max(ZERO, target.minus(matched).minus(inFlight));
@@ -1454,23 +1536,83 @@ export class StrategyEngine {
     // exit unwinds the actually-held share ratio so both legs converge to zero together.
     const equalNotional = this.equalNotional(config);
     const entryQuote = this.premiumQuote(config, 'entry');
-    if (entryQuote !== null && capacity.gt(QUANTITY_EPSILON)) {
-      const entryPremium = entryQuote.premium;
-      // The rung currently being filled: completed rungs plus any partial one gate at its level.
-      const rung = config.grid ? matched.plus(inFlight).div(perOrder).plus(RUNG_EPSILON).floor() : ZERO;
-      const level = shortPremium ? entryLevel.plus(step.mul(rung)) : entryLevel.minus(step.mul(rung));
-      const triggered = shortPremium ? entryPremium.gte(level) : entryPremium.lte(level);
-      if (triggered) {
-        // Cap grid clips at the current rung's remaining size so one wide tick cannot jump rungs.
-        const rungRoom = config.grid ? perOrder.mul(rung.plus(1)).minus(matched).minus(inFlight) : perOrder;
-        const quantity = Decimal.min(perOrder, rungRoom, capacity);
+    if (explicitGrid && !exitStarted && capacity.gt(QUANTITY_EPSILON)) {
+      let tierIndex = 0;
+      let previousQuantity = ZERO;
+      for (const [index, tier] of tiers.entries()) {
+        if (matched.plus(inFlight).lt(previousQuantity.plus(tier.quantity).minus(RUNG_EPSILON))) {
+          tierIndex = index;
+          break;
+        }
+        previousQuantity = previousQuantity.plus(tier.quantity);
+        tierIndex = index + 1;
+      }
+      const tier = tiers[tierIndex];
+      if (tier) {
+        const alreadyAssigned = Decimal.max(ZERO, matched.minus(previousQuantity));
+        const tierRoom = tier.quantity.minus(alreadyAssigned).minus(inFlight);
+        const quantity = Decimal.min(tierRoom, capacity);
         if (quantity.gt(QUANTITY_EPSILON)) {
-          const entryHedge = equalNotional ? quantity.mul(entryQuote.adrPrice).div(entryQuote.hedgePrice) : undefined;
-          await this.executeTakerClip(actor, 'entry', quantity,
-            `Premium ${entryPremium.toFixed(2)}% ${shortPremium ? '≥' : '≤'} ${level.toFixed(2)}%`
-            + ` · quotes ${entryQuote.adrPrice.toString()} / ${entryQuote.hedgePrice.toString()}`,
-          entryHedge);
-          return;
+          if (entryQuote === null) {
+            if (!config.reduceOnly) {
+              this.logEntryWaiting(actor, 'Fresh executable entry quotes required', quantity,
+                `Fresh executable entry quotes unavailable · ${this.premiumEntryMarketDiagnostic(config)}`);
+            }
+          } else {
+            const entryPremium = entryQuote.premium;
+            const triggered = shortPremium ? entryPremium.gte(tier.entryPremiumPct) : entryPremium.lte(tier.entryPremiumPct);
+            if (triggered) {
+              const entryHedge = equalNotional ? quantity.mul(entryQuote.adrPrice).div(entryQuote.hedgePrice) : undefined;
+              await this.executeTakerClip(actor, 'entry', quantity,
+                `Premium ${entryPremium.toFixed(2)}% ${shortPremium ? '≥' : '≤'} ${tier.entryPremiumPct.toFixed(2)}%`
+                  + ` · tier ${tierIndex + 1}/${tiers.length}`
+                  + ` · quotes ${entryQuote.adrPrice.toString()} / ${entryQuote.hedgePrice.toString()}`,
+                entryHedge,
+                `grid-entry-${tierIndex}`,
+              );
+              return;
+            }
+            if (!config.reduceOnly) {
+              this.logEntryWaiting(actor,
+                `Premium ${entryPremium.toFixed(2)}% ${shortPremium ? '<' : '>'} tier ${tierIndex + 1} entry ${tier.entryPremiumPct.toFixed(2)}%`,
+                quantity,
+                'Waiting for executable premium to reach the next tier');
+            }
+          }
+        }
+      }
+    }
+    if (!explicitGrid && capacity.gt(QUANTITY_EPSILON)) {
+      if (entryQuote === null) {
+        if (!config.reduceOnly) {
+          this.logEntryWaiting(actor, 'Fresh executable entry quotes required', Decimal.min(perOrder, capacity),
+            `Fresh executable entry quotes unavailable · ${this.premiumEntryMarketDiagnostic(config)}`);
+        }
+      } else {
+        const entryPremium = entryQuote.premium;
+        // The rung currently being filled: completed rungs plus any partial one gate at its level.
+        const rung = config.grid ? matched.plus(inFlight).div(perOrder).plus(RUNG_EPSILON).floor() : ZERO;
+        const level = shortPremium ? entryLevel.plus(step.mul(rung)) : entryLevel.minus(step.mul(rung));
+        const triggered = shortPremium ? entryPremium.gte(level) : entryPremium.lte(level);
+        if (triggered) {
+          // Cap grid clips at the current rung's remaining size so one wide tick cannot jump rungs.
+          const rungRoom = config.grid ? perOrder.mul(rung.plus(1)).minus(matched).minus(inFlight) : perOrder;
+          const quantity = Decimal.min(perOrder, rungRoom, capacity);
+          if (quantity.gt(QUANTITY_EPSILON)) {
+            const entryHedge = equalNotional ? quantity.mul(entryQuote.adrPrice).div(entryQuote.hedgePrice) : undefined;
+            await this.executeTakerClip(actor, 'entry', quantity,
+              `Premium ${entryPremium.toFixed(2)}% ${shortPremium ? '≥' : '≤'} ${level.toFixed(2)}%`
+              + ` · quotes ${entryQuote.adrPrice.toString()} / ${entryQuote.hedgePrice.toString()}`,
+            entryHedge);
+            return;
+          }
+        }
+        const waitingQuantity = Decimal.min(perOrder, capacity);
+        if (!config.reduceOnly && waitingQuantity.gt(QUANTITY_EPSILON)) {
+          this.logEntryWaiting(actor,
+            `Premium ${entryPremium.toFixed(2)}% ${shortPremium ? '<' : '>'} entry ${level.toFixed(2)}%`,
+            waitingQuantity,
+            'Waiting for executable premium to reach the entry level');
         }
       }
     }
@@ -1485,6 +1627,25 @@ export class StrategyEngine {
     const exitHedgeFor = (quantity: Decimal): Decimal | undefined => equalNotional && exposure.left.abs().gt(QUANTITY_EPSILON)
       ? quantity.mul(exposure.rightShares.abs()).div(exposure.left.abs())
       : undefined;
+    if (explicitGrid) {
+      for (let tierIndex = tiers.length - 1; tierIndex >= 0; tierIndex -= 1) {
+        const tierQuantity = this.premiumGridTierExposure(actor, tierIndex);
+        if (!tierQuantity.gt(QUANTITY_EPSILON)) continue;
+        const tier = tiers[tierIndex];
+        const triggered = shortPremium
+          ? exitPremium.lte(tier.takeProfitPremiumPct)
+          : exitPremium.gte(tier.takeProfitPremiumPct);
+        if (!triggered) continue;
+        await this.executeTakerClip(actor, 'exit', tierQuantity,
+          `Premium ${exitPremium.toFixed(2)}% ${shortPremium ? '≤' : '≥'} tier ${tierIndex + 1} take profit ${tier.takeProfitPremiumPct.toFixed(2)}%`
+            + ` · quotes ${exitQuote.adrPrice.toString()} / ${exitQuote.hedgePrice.toString()}`,
+          exitHedgeFor(tierQuantity),
+          `grid-exit-${tierIndex}`,
+        );
+        return;
+      }
+      return;
+    }
     if (config.grid) {
       const topRung = matched.div(perOrder).minus(RUNG_EPSILON).ceil().minus(1);
       const rungEntry = shortPremium ? entryLevel.plus(step.mul(topRung)) : entryLevel.minus(step.mul(topRung));
@@ -1591,7 +1752,14 @@ export class StrategyEngine {
     };
   }
 
-  private async executeTakerClip(actor: StrategyActor, intent: QuoteIntent, quantity: Decimal, condition: string, rightQuantityOverride?: Decimal): Promise<void> {
+  private async executeTakerClip(
+    actor: StrategyActor,
+    intent: QuoteIntent,
+    quantity: Decimal,
+    condition: string,
+    rightQuantityOverride?: Decimal,
+    clipPrefix?: string,
+  ): Promise<void> {
     const legs = this.legsForIntent(actor, intent);
     // Default hedge sizing is the strategy's fixed conversion; premium callers override it for
     // equal-notional clips (entry: priced hedge, exit: proportional unwind).
@@ -1603,7 +1771,7 @@ export class StrategyEngine {
       await this.pause(actor, `Order-size compliance check failed: ${sizeError.label ?? sizeError.code}`);
       return;
     }
-    const clip = `clip-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+    const clip = `${clipPrefix ?? 'clip'}-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
     actor.busy = true;
     try {
       const reduceOnly = intent === 'exit' || actor.config.reduceOnly;
@@ -1792,10 +1960,77 @@ export class StrategyEngine {
    */
   private async reconcileExposure(actor: StrategyActor, exposure: { left: Decimal; right: Decimal; rightShares: Decimal }): Promise<void> {
     if (actor.kind === 'premium' && this.premiumExitStarted(actor)) {
-      await this.ensurePremiumFlat(actor, exposure);
+      if (actor.config.grid && actor.config.gridTiers?.length) {
+        await this.repairGridExitImbalance(actor, exposure);
+      } else {
+        await this.ensurePremiumFlat(actor, exposure);
+      }
       return;
     }
     await this.ensureHedged(actor, exposure);
+  }
+
+  /** After a ladder exit, trim only the leg that over-filled the exit clip. */
+  private async repairGridExitImbalance(
+    actor: StrategyActor,
+    exposure: { left: Decimal; right: Decimal; rightShares: Decimal },
+  ): Promise<void> {
+    if (actor.busy || actor.status !== 'RUNNING' || this.options.now() < actor.cooldownUntil) return;
+    const imbalance = exposure.left.plus(exposure.right);
+    if (imbalance.abs().lte(QUANTITY_EPSILON)) {
+      actor.repairAttempts = 0;
+      return;
+    }
+    const quoteOrderIds = new Set([...actor.quotes.values()].map((quote) => quote.orderId));
+    if (this.openStrategyOrders(actor.id, quoteOrderIds).length > 0) return;
+    const legs = legsOf(actor.config);
+    const rightRatio = exposure.right.abs().gt(QUANTITY_EPSILON) && exposure.rightShares.abs().gt(QUANTITY_EPSILON)
+      ? exposure.rightShares.abs().div(exposure.right.abs())
+      : ONE.div(adrRatioOf(actor.config));
+    const rightOpenSign = actor.config.rightSide === 'BUY' ? ONE : ONE.neg();
+    const rightIsExcess = imbalance.mul(rightOpenSign).gt(0);
+    const repairLeg = rightIsExcess ? legs.right : legs.left;
+    const rawQuantity = rightIsExcess
+      ? imbalance.abs().mul(rightRatio)
+      : imbalance.abs();
+    const quantity = roundToStep(
+      Decimal.min(rawQuantity, repairLeg.leg === 'right' ? exposure.rightShares.abs() : exposure.left.abs()),
+      this.constraintsFor(repairLeg.symbol).lotSize,
+      'down',
+    );
+    if (!quantity.gt(QUANTITY_EPSILON)) return;
+    const exposureOnLeg = repairLeg.leg === 'right' ? exposure.rightShares : exposure.left;
+    const side: 'BUY' | 'SELL' = exposureOnLeg.gt(0) ? 'SELL' : 'BUY';
+    const sizeError = this.marketOrderSizeError(repairLeg.symbol, side, quantity);
+    if (sizeError) return;
+    if (actor.repairAttempts >= 3) {
+      await this.pause(actor, 'Unable to trim the ladder exit imbalance after 3 attempts; manual review required');
+      return;
+    }
+    actor.busy = true;
+    actor.repairAttempts += 1;
+    try {
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Ladder exit imbalance',
+        'One leg of a reduce-only tier exit was filled more than the other',
+        `${quantity.toString()} ${repairLeg.symbol}`, 'Submitting a reduce-only trim');
+      const order = await this.runtime.createOrder({
+        symbol: repairLeg.symbol, side, type: 'MARKET', timeInForce: 'IOC',
+        quantity: quantity.toString(), reduceOnly: true,
+      }, { strategyId: actor.id, strategyLeg: repairLeg.leg, strategyClip: `grid-exit-repair-${randomUUID().replaceAll('-', '').slice(0, 12)}`, riskReducing: true });
+      const settled = await this.runtime.awaitTerminalOrder(order.id, this.options.orderTimeoutMs);
+      if (settled.state === 'FILLED') actor.repairAttempts = 0;
+      this.runtime.addStrategyLog(actor.id, settled.state === 'FILLED' ? 'info' : 'warning', 'Ladder exit trim settled',
+        'Reduce-only ladder repair', `${settled.executedQuantity}/${settled.quantity}`,
+        `${settled.state} · ${failureSummary(settled.failureReason) ?? `avg ${settled.executedAveragePrice ?? '—'}`}`);
+    } catch (error) {
+      this.runtime.addStrategyLog(actor.id, 'warning', 'Ladder exit trim failed',
+        'Reduce-only ladder repair', quantity.toString(), error instanceof Error ? error.message.slice(0, 120) : 'submit error');
+    } finally {
+      actor.busy = false;
+    }
+    const refreshed = this.legExposures(actor.id, actor.config);
+    if (this.hedgeImbalance(actor.id, actor.config, refreshed).lte(QUANTITY_EPSILON)) actor.repairAttempts = 0;
+    this.persist(actor, refreshed);
   }
 
   /** Maximum hedge-leg quantity represented by one entry clip, used when only that leg remains. */

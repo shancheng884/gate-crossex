@@ -1,0 +1,7 @@
+{
+  "target": "ubuntu@your-vps-host",
+  "sshPort": 22,
+  "identityFile": "C:/Users/your-name/.ssh/id_ed25519",
+  "localPort": 17840,
+  "remotePort": 17840
+}

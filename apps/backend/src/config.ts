@@ -14,6 +14,8 @@ export interface BackendConfig {
   allowedOrigin: string;
   allowedOrigins: ReadonlySet<string>;
   allowedHosts: ReadonlySet<string>;
+  /** Explicit opt-in for headless VPS boot to re-arm persisted live strategies. */
+  autoActivateLive: boolean;
   gateRestBaseUrl: string;
   gatePublicWebSocketUrl: string;
   gatePrivateWebSocketUrl: string;
@@ -56,6 +58,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Backen
     allowedOrigin,
     allowedOrigins: new Set([allowedOrigin, ...loopbackOrigins]),
     allowedHosts: new Set(['127.0.0.1', 'localhost', '::1', ...configuredHosts]),
+    autoActivateLive: environment.GCT_AUTO_ACTIVATE_LIVE === '1',
     gateRestBaseUrl: environment.GCT_GATE_REST_URL ?? 'https://api.gateio.ws/api/v4',
     gatePublicWebSocketUrl: environment.GCT_GATE_PUBLIC_WS_URL ?? 'wss://api.gateio.ws/ws/crossex/public',
     gatePrivateWebSocketUrl: environment.GCT_GATE_PRIVATE_WS_URL ?? 'wss://api.gateio.ws/ws/crossex',

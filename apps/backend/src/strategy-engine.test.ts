@@ -1420,18 +1420,55 @@ describe('strategy engine', () => {
     expect(gateway.leverageUpdates).toHaveLength(0);
   });
 
-  it('rejects new premium grid strategies without persisting or ordering', async () => {
-    const { engine, runtime, gateway } = await createHarness();
+  it('accepts a premium strategy with explicit gradient tiers', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    markets.set('GATE_FUTURE_SKHY_USDT', '155.7', '155.8');
+    markets.set('GATE_FUTURE_SKHYNIX_USDT', '1180.2', '1180.3');
 
-    await expect(engine.startStrategy({
+    const record = await engine.startStrategy({
       kind: 'premium', asset: 'SKHY', hedgeAsset: 'SKHYNIX', adrRatio: '10',
       leftVenue: 'GATE', rightVenue: 'GATE', leftSide: 'SELL', rightSide: 'BUY',
-      entryPremiumPct: '35', grid: true, gridStepPct: '1', gridLevels: 5,
-      perOrderQuantity: '0.1', reduceOnly: false, executionMethod: 'TAKER_TAKER',
-    })).rejects.toMatchObject({ code: 'premium_grid_mode_removed', statusCode: 400 });
+      entryPremiumPct: '35', grid: true,
+      gridTiers: [
+        { entryPremiumPct: '35', takeProfitPremiumPct: '34', quantity: '0.1' },
+        { entryPremiumPct: '36', takeProfitPremiumPct: '35', quantity: '0.2' },
+      ],
+      perOrderQuantity: '0.1', maxPosition: '0.3', reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    });
 
-    expect(runtime.listStrategies()).toHaveLength(0);
+    expect(record.status).toBe('RUNNING');
+    expect(record.config.gridTiers).toHaveLength(2);
+    expect(runtime.listStrategies()).toHaveLength(1);
     expect(gateway.createdOrders).toHaveLength(0);
+  });
+
+  it('records the executable premium while an explicit gradient tier is waiting', async () => {
+    const { engine, runtime, gateway, markets } = await createHarness();
+    // Last-trade-style values can appear above 41%, while the actual entry uses SKHY bid and
+    // SKHYNIX ask. Here the executable premium is about 41.16%, below the 41.27% first tier.
+    markets.set('GATE_FUTURE_SKHY_USDT', '184.43', '184.43');
+    markets.set('GATE_FUTURE_SKHYNIX_USDT', '1305.5', '1306.5');
+    const record = await engine.startStrategy({
+      kind: 'premium', asset: 'SKHY', hedgeAsset: 'SKHYNIX', adrRatio: '10',
+      leftVenue: 'GATE', rightVenue: 'GATE', leftSide: 'SELL', rightSide: 'BUY',
+      entryPremiumPct: '41.27', grid: true,
+      gridTiers: [
+        { entryPremiumPct: '41.27', takeProfitPremiumPct: '36', quantity: '20' },
+        { entryPremiumPct: '42', takeProfitPremiumPct: '36', quantity: '26' },
+      ],
+      perOrderQuantity: '20', maxPosition: '46', reduceOnly: false, executionMethod: 'TAKER_TAKER',
+    });
+
+    await engine.tick();
+    expect(gateway.createdOrders).toHaveLength(0);
+    expect(runtime.strategyLogs(record.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: 'Entry waiting',
+        condition: 'Premium 41.16% < tier 1 entry 41.27%',
+        quantity: '20 SKHY',
+        result: 'Waiting for executable premium to reach the next tier',
+      }),
+    ]));
   });
 
   it('rejects a premium strategy before persistence or leverage changes when planned margin is insufficient', async () => {
