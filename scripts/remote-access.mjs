@@ -9,7 +9,7 @@ const configPath = process.env.GCT_REMOTE_CONFIG ?? join(dataDir, 'remote.json')
 
 function readJson(path) {
   try {
-    return JSON.parse(readFileSync(path, 'utf8'));
+    return JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''));
   } catch {
     return null;
   }
