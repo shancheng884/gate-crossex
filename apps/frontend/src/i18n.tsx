@@ -82,7 +82,7 @@ const chinese: Record<string, string> = {
   'Waiting for live WebSocket quotes from both markets.': '正在等待两个市场的 WebSocket 实时行情。',
   'A selected quote is stale; waiting for its next update.': '一个所选市场的行情已过期，正在等待下一次更新。',
   'A selected quote was delayed by more than 3 seconds; waiting for a timely update.': '一个所选市场的行情传输延迟超过 3 秒，正在等待及时更新。',
-  'Historical premium': '历史溢价', 'Selected venue pair': '所选交易所组合', 'Live pair': '实时组合', 'Stale history': '历史数据已过期', 'No data': '暂无数据', Unavailable: '暂不可用', Loading: '加载中',
+  'Historical premium': '历史溢价', 'Premium history · reference + executable': '溢价历史 · 参考价差 + 可执行价差', 'Reference premium · candle close': '参考溢价 · K线收盘价', 'Executable entry': '可执行入场', 'Executable exit': '可执行平仓', 'Uses bid/ask quotes': '按买卖盘口计算', 'The bot triggers on executable entry/exit quotes, not on the historical candle-close line.': '机器人按可成交的入场/平仓盘口触发，不按历史K线收盘线触发。', 'Selected venue pair': '所选交易所组合', 'Live pair': '实时组合', 'Stale history': '历史数据已过期', 'No data': '暂无数据', Unavailable: '暂不可用', Loading: '加载中',
   'Loading premium history…': '正在加载溢价历史…', 'Premium history unavailable': '溢价历史暂不可用',
   'No overlapping candles for this venue pair.': '该交易所组合暂无重叠K线数据。',
   'Historical price difference': '历史价差', 'Selected price difference': '所选价差', 'Loading price-difference history…': '正在加载价差历史…', 'Price-difference history unavailable': '价差历史暂不可用',

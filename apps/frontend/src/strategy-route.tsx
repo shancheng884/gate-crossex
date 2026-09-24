@@ -19,7 +19,7 @@ import {
   type TradingMode,
   type VenueFeeRate,
 } from './api.js';
-import type { FundingChartSeries } from './charts.js';
+import type { ExecutablePremiumPoint, FundingChartSeries } from './charts.js';
 import { cumulativeFundingHistory, cumulativeFundingPnl, realizedFundingEdgeWindows } from './cumulative-funding-history.js';
 import { VenueSelect } from './venue-select.js';
 import { fundingPercentScaledTo8h } from './funding-rates.js';
@@ -1260,6 +1260,8 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
     status: 'loading' | 'live' | 'stale' | 'empty' | 'failed';
   }>({ key: '', adr: [], hedge: [], adrHasMore: true, hedgeHasMore: true, status: 'loading' });
   const [hoveredPremium, setHoveredPremium] = useState<PremiumHistoryPoint | null>(null);
+  const [executablePremiumPoints, setExecutablePremiumPoints] = useState<ExecutablePremiumPoint[]>([]);
+  const lastExecutablePremiumPointRef = useRef<ExecutablePremiumPoint | null>(null);
   const [freshnessNow, setFreshnessNow] = useState(Date.now());
   const premiumHistoryLoadingRef = useRef<Set<string>>(new Set());
   const premiumHistoryRequestedRef = useRef<Set<string>>(new Set());
@@ -1426,6 +1428,30 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
   // One hedge share converts to `ratio` ADR shares, so fair ADR value = hedge price ÷ ratio.
   const fairValue = ratioNumber > 0 ? hedgePrice / ratioNumber : 0;
   const premiumNow = adrPrice > 0 && fairValue > 0 ? (adrPrice / fairValue - 1) * 100 : null;
+  const exitAdrPrice = Number((shortPremium ? adrLive?.askPrice : adrLive?.bidPrice) ?? 0);
+  const exitHedgePrice = Number((shortPremium ? hedgeLive?.bidPrice : hedgeLive?.askPrice) ?? 0);
+  const exitFairValue = ratioNumber > 0 ? exitHedgePrice / ratioNumber : 0;
+  const exitPremiumNow = exitAdrPrice > 0 && exitFairValue > 0
+    ? (exitAdrPrice / exitFairValue - 1) * 100
+    : null;
+  useEffect(() => {
+    if (premiumNow === null || exitPremiumNow === null || !livePair) return;
+    const point: ExecutablePremiumPoint = { time: Date.now(), entry: premiumNow, exit: exitPremiumNow };
+    const previous = lastExecutablePremiumPointRef.current;
+    // Quotes can update several times per second. Keep one point per second so the overlay stays
+    // readable and bounded while still showing the exact bid/ask metric used by the engine.
+    if (previous && point.time - previous.time < 1_000) return;
+    lastExecutablePremiumPointRef.current = point;
+    setExecutablePremiumPoints((current) => {
+      const cutoff = point.time - PAIR_HISTORY_RANGES[premiumRange].durationMs;
+      return [...current, point].filter((item) => item.time >= cutoff).slice(-4_000);
+    });
+  }, [exitPremiumNow, livePair, premiumNow, premiumRange]);
+
+  useEffect(() => {
+    setExecutablePremiumPoints([]);
+    lastExecutablePremiumPointRef.current = null;
+  }, [premiumHistoryKey]);
   // Venue selection renders before the loading effect above runs. Gate the chart data against
   // the requested pair synchronously so the previous pair's series can never paint under the
   // new pair's heading, even for a single frame.
@@ -1667,7 +1693,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
         <article className="premium-history-panel terminal-panel">
           <header className="premium-history-head">
             <div>
-              <p className="eyebrow">{t('Historical premium')}</p>
+              <p className="eyebrow">{t('Premium history · reference + executable')}</p>
               <h2>{adrExchange.name} {ADR_ASSET} <span>vs</span> {hedgeExchange.name} {ADR_HEDGE_ASSET} ÷ {adrRatio || '—'}</h2>
               <small>{t('Selected venue pair')}</small>
             </div>
@@ -1681,7 +1707,7 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
           </header>
           <div className="premium-history-summary">
             <div className="premium-history-value">
-              <span><i /> {adrExchange.name} / {hedgeExchange.name} {t('ADR premium')}</span>
+              <span><i /> {t('Reference premium · candle close')}</span>
               <strong className={displayedPremium !== null && displayedPremium < 0 ? 'negative' : ''}>
                 {displayedPremium !== null ? `${displayedPremium >= 0 ? '+' : ''}${displayedPremium.toFixed(2)}%` : '—'}
               </strong>
@@ -1698,10 +1724,16 @@ export function PremiumStrategyView({ marketSnapshot, catalog, strategies, balan
               <div><dt>{t('Premium gap')}</dt><dd>{displayedGap !== null ? `${displayedGap >= 0 ? '+' : ''}${priceText(displayedGap)}` : '—'}</dd></div>
             </dl>
           </div>
+          <div className="premium-executable-summary">
+            <div><span><i className="entry" />{t('Executable entry')}</span><strong>{premiumNow !== null ? `${premiumNow >= 0 ? '+' : ''}${premiumNow.toFixed(2)}%` : '—'}</strong><small>{t('Uses bid/ask quotes')}</small></div>
+            <div><span><i className="exit" />{t('Executable exit')}</span><strong>{exitPremiumNow !== null ? `${exitPremiumNow >= 0 ? '+' : ''}${exitPremiumNow.toFixed(2)}%` : '—'}</strong><small>{t('Uses bid/ask quotes')}</small></div>
+            <p>{t('The bot triggers on executable entry/exit quotes, not on the historical candle-close line.')}</p>
+          </div>
           <Suspense fallback={<div className="premium-history-chart chart-module-loading" role="status">{t('Loading premium history…')}</div>}>
             <PremiumHistoryChart
               key={historySeriesKey}
               points={premiumPoints}
+              executablePoints={executablePremiumPoints}
               seriesKey={historySeriesKey}
               visibleDurationMs={PAIR_HISTORY_RANGES[premiumRange].durationMs}
               theme={theme}

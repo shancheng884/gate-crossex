@@ -185,13 +185,21 @@ interface HistoryChartProps<T extends HistoryChartPoint> {
   onLoadMore: () => void;
 }
 
-const PREMIUM_PALETTES: Record<ChartTheme, { grid: string; label: string; line: string; fillTop: string; fillBottom: string; crosshair: string }> = {
+export interface ExecutablePremiumPoint {
+  time: number;
+  entry: number;
+  exit: number;
+}
+
+const PREMIUM_PALETTES: Record<ChartTheme, { grid: string; label: string; line: string; fillTop: string; fillBottom: string; entry: string; exit: string; crosshair: string }> = {
   dark: {
     grid: '#1a2524',
     label: '#66756f',
     line: '#b8ff3d',
     fillTop: 'rgba(184, 255, 61, .17)',
     fillBottom: 'rgba(184, 255, 61, .015)',
+    entry: '#18d6ad',
+    exit: '#f0b35b',
     crosshair: '#53645f',
   },
   light: {
@@ -200,6 +208,8 @@ const PREMIUM_PALETTES: Record<ChartTheme, { grid: string; label: string; line: 
     line: '#008f72',
     fillTop: 'rgba(0, 143, 114, .16)',
     fillBottom: 'rgba(0, 143, 114, .015)',
+    entry: '#008f72',
+    exit: '#b87818',
     crosshair: '#91a69f',
   },
 };
@@ -221,10 +231,13 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
   onLoadMore,
   unit,
   ariaLabel,
-}: HistoryChartProps<T> & { unit: '%' | ' bps'; ariaLabel: string }) {
+  executablePoints = [],
+}: HistoryChartProps<T> & { unit: '%' | ' bps'; ariaLabel: string; executablePoints?: ExecutablePremiumPoint[] }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Area'> | null>(null);
+  const executableEntrySeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
+  const executableExitSeriesRef = useRef<ISeriesApi<'Line'> | null>(null);
   const pointByTimeRef = useRef<Map<number, T>>(new Map());
   const onHoverRef = useRef(onHover);
   const onLoadMoreRef = useRef(onLoadMore);
@@ -251,6 +264,20 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
       crosshairMarkerVisible: true,
       crosshairMarkerRadius: 4,
     });
+    const executableEntrySeries = chart.addSeries(LineSeries, {
+      lineWidth: 2,
+      lineStyle: LineStyle.Dashed,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+    const executableExitSeries = chart.addSeries(LineSeries, {
+      lineWidth: 2,
+      lineStyle: LineStyle.Dashed,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
     chart.subscribeCrosshairMove((param) => {
       const datum = param.seriesData.get(series) as AreaData<UTCTimestamp> | undefined;
       onHoverRef.current(datum ? pointByTimeRef.current.get(datum.time) ?? null : null);
@@ -263,9 +290,13 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
     chart.timeScale().subscribeVisibleLogicalRangeChange(handleVisibleRange);
     chartRef.current = chart;
     seriesRef.current = series;
+    executableEntrySeriesRef.current = executableEntrySeries;
+    executableExitSeriesRef.current = executableExitSeries;
     return () => {
       chartRef.current = null;
       seriesRef.current = null;
+      executableEntrySeriesRef.current = null;
+      executableExitSeriesRef.current = null;
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(handleVisibleRange);
       chart.remove();
     };
@@ -317,6 +348,8 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
       crosshairMarkerBorderColor: palette.line,
       crosshairMarkerBackgroundColor: palette.line,
     });
+    executableEntrySeriesRef.current?.applyOptions({ color: palette.entry });
+    executableExitSeriesRef.current?.applyOptions({ color: palette.exit });
   }, [theme, locale]);
 
   useEffect(() => {
@@ -333,6 +366,14 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
       time: Math.floor(point.time / 1000) as UTCTimestamp,
       value: point.value,
     })));
+    executableEntrySeriesRef.current?.setData(executablePoints.map((point) => ({
+      time: Math.floor(point.time / 1000) as UTCTimestamp,
+      value: point.entry,
+    })));
+    executableExitSeriesRef.current?.setData(executablePoints.map((point) => ({
+      time: Math.floor(point.time / 1000) as UTCTimestamp,
+      value: point.exit,
+    })));
     if (shownKeyRef.current !== seriesKey && points.length > 1) {
       shownKeyRef.current = seriesKey;
       const latestTime = points[points.length - 1].time;
@@ -344,7 +385,7 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
       chart.timeScale().setVisibleRange(visibleRange);
     }
     oldestTimeRef.current = nextOldestTime;
-  }, [points, seriesKey, visibleDurationMs]);
+  }, [executablePoints, points, seriesKey, visibleDurationMs]);
 
   const latest = points[points.length - 1];
   const summary = latest
@@ -356,7 +397,7 @@ function SpreadHistoryChart<T extends HistoryChartPoint>({
   </div>;
 }
 
-export function PremiumHistoryChart(props: HistoryChartProps<PremiumHistoryPoint>) {
+export function PremiumHistoryChart(props: HistoryChartProps<PremiumHistoryPoint> & { executablePoints?: ExecutablePremiumPoint[] }) {
   return <SpreadHistoryChart {...props} unit="%" ariaLabel="Historical ADR premium" />;
 }
 
